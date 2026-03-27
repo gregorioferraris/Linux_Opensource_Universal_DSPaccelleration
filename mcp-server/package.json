@@ -1,0 +1,13 @@
+{
+  "name": "dsp-accel-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for Monitoring and Managing the Linux DSP Acceleration System",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}

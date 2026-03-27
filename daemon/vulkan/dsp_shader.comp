@@ -1,0 +1,48 @@
+#version 450
+
+// Il layout di esecuzione locale: la GPU processerà l'audio a blocchi paralleli di 64 sample alla volta per Compute Unit.
+layout (local_size_x = 64) in;
+
+// Il nostro RingBuffer mappato direttamente nella RAM della Scheda Video (SSBO)
+// Eseguiamo i calcoli "In-Place" per evitare un buffer in più e raddoppiare la latenza
+layout(set = 0, binding = 0) buffer AudioBuffer {
+    float samples[];
+};
+
+// "Push Constants": Parametri inviati diretti ai registri GPU senza allocare memoria.
+// Molto più veloci! Utili per controlli in tempo reale (automazioni DAW, gain, preset)
+layout(push_constant) uniform PushConstants {
+    uint frame_count;
+    float global_gain;
+    float soft_clip_threshold;
+} params;
+
+//---------------------------------------------------------
+// COMPUTE SHADER KERNEL (Vero motore DSP Hardware)
+//---------------------------------------------------------
+void main() {
+    // ID univoco del core GPU che sta eseguendo questa singola istanza (es. Core N. 1024)
+    uint index = gl_GlobalInvocationID.x;
+    
+    // Safety check: evita Buffer Overflows se la DAW invia buffer non multipli di 64
+    if(index >= params.frame_count) {
+        return;
+    }
+
+    // 1. Lettura dal Bus Hardware (VRAM/GTTRAM)
+    float sample = samples[index];
+    
+    // 2. DSP Algorithm
+    // A questo punto il limite è l'immaginazione. Applichiamo un Gain...
+    sample *= params.global_gain;
+    
+    // ...e una curva di Saturazione Pura / Soft Clipping ultraveloce
+    if (sample > params.soft_clip_threshold) {
+        sample = params.soft_clip_threshold + (sample - params.soft_clip_threshold) / (1.0 + pow((sample - params.soft_clip_threshold), 2.0));
+    } else if (sample < -params.soft_clip_threshold) {
+        sample = -params.soft_clip_threshold - (-sample - params.soft_clip_threshold) / (1.0 + pow((-sample - params.soft_clip_threshold), 2.0));
+    }
+    
+    // 3. Scrittura del risultato ri-pompato indietro alla memoria visibile dal Plugin (Host)
+    samples[index] = sample;
+}
