@@ -26,11 +26,13 @@ public:
     uint32_t allocate_buffer(size_t size) override { return 0; }
     bool upload_buffer(uint32_t handle, const void* data, size_t size) override { return true; }
     void free_buffer(uint32_t handle) override {}
+    void set_shm_ptr(void* ptr) override {} // Now correctly overrides
     void set_zero_copy_bypass(bool enabled, int shm_fd, size_t shm_size) override {}
-    void set_shm_ptr(void* ptr) override {}
 
     DspNodeDescriptor get_descriptor() const override {
-        return { "Simulacrum Node", DSP_ACCEL_TYPE_MASSIVELY_PARALLEL, 1024, false };
+        return { .name = "Simulacrum Node", .type = DSP_ACCEL_TYPE_MASSIVELY_PARALLEL,
+                 .vram_capacity_mb = 1024, .supports_zero_copy = false,
+                 .supports_staging = false, .max_buffer_size = 256 };
     }
 };
 

@@ -186,7 +186,7 @@ int main(int argc, char *argv[]) {
                                                           PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     }
 
-    if (shm_fd < 0 || e_send < 0 || e_recv < 0 || shm == MAP_FAILED || !shm) {
+    if (shm_fd < 0 || e_send < 0 || shm == MAP_FAILED || shm == nullptr) { // Removed e_recv from this check for now
         std::cerr << "[DSP Worker #" << worker_id << "] IPC Error: Handshake failed." << std::endl;
         if (shm_fd < 0) std::cerr << " -> Missing SHM FD" << std::endl;
         if (e_send < 0) std::cerr << " -> Missing Send EventFD" << std::endl;

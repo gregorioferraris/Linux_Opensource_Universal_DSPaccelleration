@@ -9,6 +9,7 @@
 #include <sys/eventfd.h>
 #include <csignal>
 #include <cstring>
+#include <sys/wait.h> // For waitpid
 #include "ipc/include/ipc_shm.hpp"
 
 #define SOCKET_PATH "/tmp/dsp_accel_daemon.sock"
@@ -20,6 +21,29 @@ void handle_sig(int) { running = false; }
 
 // Helper per inviare File Descriptor via SCM_RIGHTS
 static int send_fd(int socket, int fd) {
+    // This function is for sending FDs over an *already connected* Unix domain socket.
+    // The current daemon/worker handshake is simplified.
+    // In a real scenario, the supervisor would fork, then in the child, set up a socketpair,
+    // send the FDs over one end of the socketpair, and then exec the worker.
+    // For now, this is a placeholder.
+    // The current implementation in dsp_accel_sdk.cpp and worker_main.cpp expects
+    // the FDs to be received via recv_fd on the client_fd (SDK) or STDIN_FILENO (worker).
+    // This `send_fd` is not directly used in the current daemon/worker fork/exec flow.
+    // It's more relevant for the SDK-Daemon communication.
+
+    // For the daemon to worker communication, the FDs are typically passed via `exec`
+    // by setting up the file descriptors before the `exec` call, or by passing them
+    // as arguments if the worker is designed to receive them that way.
+    // The current worker_main.cpp expects them from STDIN_FILENO, which implies
+    // the supervisor would redirect the FDs to the worker's stdin.
+    // This is a complex IPC topic. For now, we'll keep the `send_fd` as is,
+    // but acknowledge its current limited use in the daemon-worker fork/exec.
+
+    // The `send_fd` in `dsp_accel_sdk.cpp` is correct for SDK-Daemon communication.
+    // The `recv_fd` in `dsp_accel_sdk.cpp` and `daemon/worker_main.cpp` is also correct
+    // for receiving FDs. The challenge is how the daemon *sends* them to the worker.
+    // For the `fork/exec` scenario, it's usually done by duplicating FDs to stdin/stdout
+    // or using a socketpair.
     char buf[1] = {0};
     struct iovec iov = { .iov_base = buf, .iov_len = 1 };
     char cmsg_buf[CMSG_SPACE(sizeof(int))];
@@ -34,6 +58,13 @@ static int send_fd(int socket, int fd) {
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
     return sendmsg(socket, &msg, 0);
+}
+
+// Helper to receive FDs (used by worker, but also useful for daemon to receive from SDK if needed)
+static int recv_fd(int socket) {
+    // This is a placeholder. The actual implementation is in dsp_accel_sdk.cpp and worker_main.cpp
+    // For daemon, it's more about sending FDs to the worker.
+    return -1; 
 }
 
 int main() {

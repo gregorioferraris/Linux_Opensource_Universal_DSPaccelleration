@@ -1,16 +1,22 @@
 #pragma once
 #include "ipc/include/ipc_shm.hpp"
+#include "../sdk/include/dsp_accel_sdk.h" // For DspWorkloadType
 #include <string>
 #include <vector>
 
 namespace DspAccel {
 namespace Daemon {
 
+// Forward declaration for IDspNode
+class IDspNode;
+
 struct DspNodeDescriptor {
     std::string name;
     DspWorkloadType type;
     size_t vram_capacity_mb;
     bool supports_zero_copy;
+    bool supports_staging; // Added for memory management
+    size_t max_buffer_size; // Max audio frame size it can process
 };
 
 /**
@@ -35,6 +41,7 @@ public:
     virtual bool upload_buffer(uint32_t handle, const void* data, size_t size) = 0;
     virtual void free_buffer(uint32_t handle) = 0;
     
+    virtual void set_shm_ptr(void* ptr) = 0; // Added for worker to pass SHM pointer
     // Tracking Mode (v2.0)
     virtual void set_zero_copy_bypass(bool enabled, int shm_fd, size_t shm_size) = 0;
 };

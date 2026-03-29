@@ -11,7 +11,7 @@
 #include <sys/eventfd.h>
 #include <poll.h>
 
-#define DAEMON_SOCKET_PATH "/run/dsp_accel/daemon.sock"
+#define DAEMON_SOCKET_PATH "/tmp/dsp_accel_daemon.sock"
 
 using namespace DspAccel::Ipc;
 

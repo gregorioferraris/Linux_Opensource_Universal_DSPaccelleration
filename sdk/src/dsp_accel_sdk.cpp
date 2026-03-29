@@ -115,9 +115,10 @@ dsp_accel_sdk_ctx_t* dsp_accel_sdk_connect(DspWorkloadType type, float cost_mflo
     }
 
     // Receive 3 FDs from daemon: shm_fd, eventfd_send, eventfd_recv
-    ctx->shm_fd       = recv_fd(ctx->socket_fd);
-    ctx->eventfd_send = recv_fd(ctx->socket_fd);
-    ctx->eventfd_recv = recv_fd(ctx->socket_fd);
+    // The daemon sends these FDs over the connected Unix domain socket.
+    ctx->shm_fd       = recv_fd(ctx->socket_fd); // First FD is SHM
+    ctx->eventfd_send = recv_fd(ctx->socket_fd); // Second FD is eventfd_send
+    ctx->eventfd_recv = recv_fd(ctx->socket_fd); // Third FD is eventfd_recv
 
     // Fix #3: validate ALL fds before using any
     if (ctx->shm_fd < 0 || ctx->eventfd_send < 0 || ctx->eventfd_recv < 0) {
