@@ -19,27 +19,6 @@ static const void *plugin_get_extension(const struct clap_plugin *plugin, const 
 static void plugin_on_main_thread(const struct clap_plugin *plugin);
 
 // Plugin class structure
-static const clap_plugin_class_t plugin_class = {
-    .clap_version = CLAP_VERSION_INIT,
-    .plugin_id = "com.example.dsp_test_plugin",
-    .name = "DSP Accel Dummy",
-    .vendor = "Example",
-    .url = "https://example.com",
-    .manual_url = "",
-    .support_url = "",
-    .version = "1.0.0",
-    .description = "A dummy CLAP plugin distributing load via PipeWire Module",
-    .init = plugin_init,
-    .destroy = plugin_destroy,
-    .activate = plugin_activate,
-    .deactivate = plugin_deactivate,
-    .start_processing = plugin_start_processing,
-    .stop_processing = plugin_stop_processing,
-    .reset = plugin_reset,
-    .process = plugin_process,
-    .get_extension = plugin_get_extension,
-    .on_main_thread = plugin_on_main_thread,
-};
 
 // Plugin instance data
 struct MyPlugin {
@@ -78,7 +57,7 @@ static clap_process_status plugin_process(const struct clap_plugin *plugin, cons
         float* channel_ptrs[8] = {};
         uint32_t ch_count = 0;
         if (process->audio_inputs_count > 0) {
-            const auto *in = process->audio_inputs;
+            const auto *in = &process->audio_inputs[0];
             ch_count = in->channel_count < 8 ? in->channel_count : 8;
             for (uint32_t ch = 0; ch < ch_count; ch++)
                 channel_ptrs[ch] = in->data32[ch];
@@ -89,7 +68,7 @@ static clap_process_status plugin_process(const struct clap_plugin *plugin, cons
         if (sent && process->audio_outputs_count > 0) {
             // Fix #1: read GPU output into DAW output buffers
             float* out_ptrs[8] = {};
-            auto *out = process->audio_outputs;
+            auto *out = &process->audio_outputs[0];
             uint32_t out_ch = out->channel_count < 8 ? out->channel_count : 8;
             for (uint32_t ch = 0; ch < out_ch; ch++)
                 out_ptrs[ch] = out->data32[ch];
@@ -103,8 +82,8 @@ static clap_process_status plugin_process(const struct clap_plugin *plugin, cons
     if (!processed_by_hw) {
         for (uint32_t i = 0; i < process->audio_outputs_count; ++i) {
             if (i < process->audio_inputs_count) {
-                const auto *in = process->audio_inputs[i];
-                auto *out = process->audio_outputs[i];
+                const auto *in = &process->audio_inputs[i];
+                auto *out = &process->audio_outputs[i];
                 for (uint32_t ch = 0; ch < out->channel_count; ++ch) {
                     float *out_data = out->data32[ch];
                     const float *in_data = (ch < in->channel_count) ? in->data32[ch] : nullptr;
@@ -141,7 +120,7 @@ static const void *plugin_get_extension(const struct clap_plugin *plugin, const 
 // activate: open hardware SDK connection and report latency to host
 static bool plugin_activate(const struct clap_plugin *plugin, double, uint32_t, uint32_t) {
     auto *p = static_cast<MyPlugin *>(plugin->plugin_data);
-    p->sdk_ctx = dsp_accel_sdk_connect(DSP_TYPE_MASSIVELY_PARALLEL, 150.0f);
+    p->sdk_ctx = dsp_accel_sdk_connect(DSP_ACCEL_TYPE_MASSIVELY_PARALLEL, 150.0f);
     // Fix #4: notify host of hardware latency for Plugin Delay Compensation
     if (p->sdk_ctx) {
         const auto *host_latency = static_cast<const clap_host_latency_t *>(
@@ -164,6 +143,7 @@ static void plugin_on_main_thread(const struct clap_plugin*) {}
 // Factory entry point
 static uint32_t plugin_factory_get_plugin_count(const struct clap_plugin_factory *factory) { return 1; }
 static const clap_plugin_descriptor_t *plugin_factory_get_plugin_descriptor(const struct clap_plugin_factory *factory, uint32_t index) {
+    static const char *features[] = { CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, nullptr };
     static const clap_plugin_descriptor_t desc = {
         .clap_version = CLAP_VERSION_INIT,
         .id = "com.example.dsp_test_plugin",
@@ -174,7 +154,7 @@ static const clap_plugin_descriptor_t *plugin_factory_get_plugin_descriptor(cons
         .support_url = "",
         .version = "1.0.0",
         .description = "Hardware Accel Test Plugin",
-        .features = (const char *[]){ CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, nullptr }
+        .features = features
     };
     return &desc;
 }

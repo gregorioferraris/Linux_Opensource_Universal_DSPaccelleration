@@ -3,9 +3,10 @@
 Welcome! This guide explains how to extend and contribute to the project.
 
 ## 1. Project Structure
+- `/`: Root contains setup scripts and the core `Linux_DSP_acceleration.hpp` (Global IPC types).
 - `/daemon/pipewire`: The Supervisor module (PipeWire integration).
 - `/daemon/vulkan`: GPU compute implementation.
-- `/daemon/ipc`: Key IPC structures and ring buffers.
+- `/daemon/ipc`: Lower-level IPC primitives and shared memory management.
 - `/sdk`: The C SDK for audio plugins.
 - `/mcp-server`: Node.js management bridge.
 - `/tests`: Unit tests and crash simulations.
@@ -68,3 +69,9 @@ If your plugin is used for **live monitoring (tracking)**, you can further reduc
 
 > [!IMPORTANT]
 > Zero-Copy mode requires the Vulkan driver to support external memory extensions. If unsupported, the system automatically falls back to standard "Safe Copy" mode with 1-block latency.
+
+## 9. Multi-Instance State Management
+When developing algorithms that require state (like IIR filters or reverbs):
+1. Use the `instance_id` provided in the `DspAudioFrame`.
+2. The Worker automatically allocates a persistent VRAM buffer for new IDs.
+3. Ensure your shader reads from and writes to the `StateBuffer` bound to `binding = 1` (Work in progress).

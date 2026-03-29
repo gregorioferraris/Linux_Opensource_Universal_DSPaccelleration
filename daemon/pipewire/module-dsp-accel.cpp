@@ -1,8 +1,16 @@
 #include <pipewire/pipewire.h>
+#include <pipewire/impl.h>
+#include <pipewire/core.h>
 #include <spa/utils/defs.h>
 #include <spa/utils/list.h>
 #include <spa/utils/hook.h>
+#include <spa/support/loop.h>
+#include <sys/eventfd.h>
 #include <atomic>
+#include <errno.h>
+#include <string.h>
+#include "../ipc/include/ipc_shm.hpp"
+#include "../../sdk/include/dsp_accel_sdk.h"
 
 extern "C" {
 
@@ -14,7 +22,6 @@ extern "C" {
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "../ipc/include/ipc_shm.hpp"
 #include "../../clap/extension/dsp_accel.h"
 
 #define HEARTBEAT_TIMEOUT_MS 500
@@ -30,7 +37,7 @@ struct dsp_accel_node {
     int e_recv;      
 };
 
-#define DSP_DAEMON_SOCKET_PATH "/run/dsp_accel/daemon.sock"
+#define DSP_DAEMON_SOCKET_PATH "/tmp/dsp_accel_daemon.sock"
 
 struct module_dsp_accel_data {
     struct pw_context *context;
@@ -77,6 +84,11 @@ static void spawn_worker(struct module_dsp_accel_data *d, int node_index) {
     // 2. Map SHM locally for the Supervisor
     node->shm = (DspAccel::Ipc::DspSharedMemory*)mmap(NULL, sizeof(DspAccel::Ipc::DspSharedMemory), 
                                                       PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fd, 0);
+    if (node->shm == MAP_FAILED) {
+        pw_log_error("Supervisor: Failed to mmap SHM for worker %d", node->worker_id);
+        node->shm = nullptr;
+        return;
+    }
     
     // 3. Create control socket for FD passing
     int sv[2]; 
@@ -99,7 +111,14 @@ static void spawn_worker(struct module_dsp_accel_data *d, int node_index) {
         char id_str[16];
         snprintf(id_str, sizeof(id_str), "%i", node->worker_id);
 
-        execl("./dsp-accel-worker", "dsp-accel-worker", "--type", type_str, "--id", id_str, NULL);
+        // Use an environment variable for the worker path, or fallback to a sensible default
+        const char* worker_path = getenv("DSP_WORKER_BIN");
+        if (!worker_path) worker_path = "./daemon/pipewire/dsp-accel-worker";
+
+        pw_log_info("Supervisor: Attempting to execute worker at %s", worker_path);
+        execl(worker_path, "dsp-accel-worker", "--type", type_str, "--id", id_str, NULL);
+        
+        pw_log_error("Supervisor: execl failed: %s", strerror(errno));
         _exit(1); 
     } else if (node->worker_pid > 0) {
         // --- PARENT (Supervisor) ---
@@ -121,13 +140,14 @@ static int handle_plugin_request(struct module_dsp_accel_data *d, const clap_plu
     if (!metadata || !d || d->num_compute_nodes == 0) return -1;
     
     // 1. Identify optimal backend for this workload
-    DspWorkloadType type = metadata->get_workload_type(plugin);
+    DspWorkloadType type = (DspWorkloadType)metadata->get_workload_type(plugin);
     
     // 2. Supervisor Routing: Find a healthy worker for this type
     struct dsp_accel_node *best_node = nullptr;
     for (int i = 0; i < d->num_compute_nodes; i++) {
         struct dsp_accel_node *node = &d->compute_nodes[i];
-        
+        if (!node->shm) continue;
+
         // 2. Supervisor Routing: Dynamic Load Balancing
         auto& ctrl = node->shm->workers[node->worker_id];
         uint32_t load = ctrl.load_pct.load(std::memory_order_relaxed);
@@ -162,7 +182,10 @@ static int handle_plugin_request(struct module_dsp_accel_data *d, const clap_plu
         return -1;
     }
 
-    return 42; // SHM FD
+    // In the CLAP extension context, we return 0 to indicate success.
+    // The actual FD passing is handled via the Unix socket in on_plugin_connection.
+    pw_log_info("Supervisor: Routing plugin request to worker %d", best_node->worker_id);
+    return 0;
 }
 
 static void on_plugin_connection(void *data, int fd, uint32_t mask) {
@@ -224,7 +247,7 @@ static void module_destroy(void *data) {
     if (d->compute_nodes) {
         for (int i = 0; i < d->num_compute_nodes; i++) {
             struct dsp_accel_node *node = &d->compute_nodes[i];
-            if (node->shm) {
+            if (node->shm && node->shm != MAP_FAILED) {
                 munmap(node->shm, sizeof(DspAccel::Ipc::DspSharedMemory));
             }
             // Fix: cleanup FDs
@@ -240,8 +263,8 @@ static void module_destroy(void *data) {
 }
 
 static const struct pw_impl_module_events module_events = {
-    PW_VERSION_IMPL_MODULE_EVENTS,
-    .destroy = module_destroy,
+    .version = PW_VERSION_IMPL_MODULE_EVENTS,
+    .destroy = (void (*)(void *))module_destroy,
 };
 
 SPA_EXPORT
@@ -263,7 +286,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args) {
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, DSP_DAEMON_SOCKET_PATH, sizeof(addr.sun_path)-1);
         unlink(addr.sun_path);
-        mkdir("/run/dsp_accel", 0755); 
         if (bind(data->server_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             listen(data->server_fd, 5);
             data->socket_source = pw_loop_add_io(data->main_loop, data->server_fd, 
@@ -272,6 +294,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args) {
             pw_log_error("Supervisor: Failed to bind socket: %s", strerror(errno));
             close(data->server_fd);
             data->server_fd = -1;
+            return -errno; // Return actual error to PipeWire loader
         }
     } else {
         pw_log_error("Supervisor: Failed to create socket: %s", strerror(errno));
@@ -293,12 +316,14 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args) {
     // 3. Setup MCP Monitoring Timer (Dump state to JSON every 500ms)
     auto dump_state = [](void *data, uint64_t expirations) {
         auto *d = (struct module_dsp_accel_data *)data;
-        FILE *f = fopen("/run/dsp_accel/monitor.json", "w");
+        FILE *f = fopen("/tmp/dsp_accel_monitor.json", "w");
         if (!f) return;
         
         fprintf(f, "{\n  \"timestamp\": %lu,\n  \"workers\": [\n", time(NULL));
         for (int i = 0; i < d->num_compute_nodes; i++) {
             auto *node = &d->compute_nodes[i];
+            if (!node->shm) continue; // Prevent Segfault if worker failed to init
+
             auto& ctrl = node->shm->workers[node->worker_id];
             fprintf(f, "    {\n      \"id\": %d,\n      \"type\": \"%s\",\n      \"status\": \"%s\",\n      \"load\": %u,\n      \"heartbeat\": %lu\n    }%s\n",
                     node->worker_id, 
@@ -312,10 +337,12 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args) {
         fclose(f);
     };
 
+    struct spa_source *timer = pw_loop_add_timer(data->main_loop, dump_state, data);
+    
     struct timespec value, interval;
     value.tv_sec = 0; value.tv_nsec = 500 * 1000 * 1000;
     interval.tv_sec = 0; interval.tv_nsec = 500 * 1000 * 1000;
-    pw_loop_add_timer(data->main_loop, true, dump_state, data);
+    pw_loop_update_timer(data->main_loop, timer, &value, &interval, false);
 
     return 0;
 }

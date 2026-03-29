@@ -1,103 +1,66 @@
-# Linux DSP Acceleration System
+# Linux Universal DSP Acceleration (DSPA)
 
-![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)
-![Build: Passing](https://img.shields.io/badge/Build-Passing-brightgreen.svg)
-![Version: 0.1.0--alpha](https://img.shields.io/badge/Version-0.1.0--alpha-orange.svg)
+A high-performance, real-time framework for offloading audio DSP workloads from CLAP plugins to hardware accelerators (GPUs via Vulkan, NPUs, and Remote Hosts) using PipeWire as the supervisor.
 
-> [!WARNING]
-> This project is currently in early **Alpha (Work In Progress)**. It is not yet recommended for production environments.
+## Architecture Highlights
 
-A high-performance, crash-resilient, and heterogeneous audio DSP acceleration system for Linux.
+- **Zero-Copy IPC**: Utilizes `memfd` and Single-Producer Single-Consumer (SPSC) lock-free ring buffers for ultra-low latency audio transfer between the plugin and the hardware worker.
+- **Vulkan Compute Backend**: Harnesses GPU power for massively parallel DSP tasks (FFT, FIR, Additive Synthesis) with real-time hardware scheduling.
+- **PipeWire Integration**: A supervisor module manages hardware worker lifecycles, load balancing, and dynamic routing.
+- **Hardware-Agnostic SDK**: A simple C++ SDK allows plugins to connect to the acceleration infrastructure with automatic CPU fallback.
+- **Resilience & Monitoring**: Integrated watchdog heartbeats and error signaling ensure the audio thread never hangs, even if hardware drivers fail.
 
-## Documentation
+## Components
 
-Experience the full project depth through our dedicated guides:
-- [**Project Vision**](VISION.md): Our mission to close the professional audio gap.
-- [**Installation Guide**](docs/INSTALL.md): Detailed setup for Linux and Windows (WSL).
-- [**Architecture Overview**](docs/ARCHITECTURE.md): Deep dive into the Supervisor-Worker model and IPC.
-- [**Developer's Guide**](docs/DEVELOPER_GUIDE.md): Technical manual for contributing and adding hardware backends.
+1.  **Supervisor (PipeWire Module)**: Spawns and monitors workers, handles plugin connection requests, and performs load balancing.
+2.  **Workers**: Independent processes (Vulkan, NPU, Remote) that execute the actual DSP algorithms with real-time priority (`SCHED_FIFO`).
+3.  **SDK**: The interface used by plugins to communicate with the Supervisor and Workers.
+4.  **Network Node**: Extends acceleration to external Linux machines via low-latency UDP with jitter buffering.
 
-## Overview
-...
+## Prerequisites
 
-## Architecture
+- **OS**: Linux (Ubuntu 24.04+ recommended) or WSL2 with GPU support.
+- **Build Tools**: CMake 3.20+, Ninja, GCC/G++ 13+.
+- **Libraries**: PipeWire 0.3+, Vulkan SDK, glslang-tools.
 
-```mermaid
-graph TD
-    PW[PipeWire Server] -->|IPC| SDK[CLAP Plugin SDK]
-    SDK -->|Shared Memory| SHM[memfd Audio Queues]
-    PW -->|Supervisor| SV[Resource Manager]
-    SV -->|Spawn/Monitor| W1[Vulkan Worker]
-    SV -->|Spawn/Monitor| W2[NPU Worker]
-    W1 <-->|Audio Data| SHM
-    W2 <-->|Audio Data| SHM
-    
-    subgraph "Process Isolation"
-        W1
-        W2
-    end
+## Building
+
+Run the environment setup script to install dependencies and clone the CLAP SDK:
+
+```bash
+./setup_linux_env.sh
 ```
 
-### 1. Supervisor (PipeWire Proxy)
-...
-...
-## Technical Specification
+Compile the project:
 
-### Worker Control Block
-Each hardware process is monitored via a 64-byte aligned structure in Shared Memory:
-| Field | Type | Description |
-|-------|------|-------------|
-| `heartbeat` | `atomic<u64>` | Incremented by Worker every 10ms |
-| `last_error`| `atomic<enum>`| `DEVICE_LOST`, `OOM`, etc. |
-| `is_ready`  | `atomic<bool>`| True after HW initialization |
-| `should_restart`| `atomic<bool>`| Command from Supervisor |
+```bash
+mkdir build && cd build
+cmake -G Ninja ..
+ninja
+```
 
-### 2. Independent Workers
-Hardware backends are isolated into standalone processes (`dsp-accel-worker`). 
-- **Vulkan Worker**: Leverages GPU compute for massively parallel DSP.
-- **NPU Worker**: Optimized for tensor-based machine learning/DSP models.
-- **DSP Worker**: Specialized for fixed-point/low-power arrays.
+## Running
 
-### 3. Fault-Tolerant IPC
-- **Zero-Latency**: Uses `memfd_create` and `SCM_RIGHTS` (FD passing) to share audio buffers without disk I/O.
-- **Stability**: Lock-free SPSC ring buffers ensure real-time safety.
-- **Watchdog**: A shared memory heartbeat allows the Supervisor to detect and restart crashed workers instantly.
+1.  **Load the Supervisor**:
+    ```bash
+    pw-cli load-module ./build/daemon/pipewire/module-dsp-acc-accel.so
+    ```
+2.  **Start a Hardware Worker**:
+    ```bash
+    ./build/daemon/pipewire/dsp-accel-worker --type vulkan --id 0
+    ```
+3.  **Run the Example**:
+    ```bash
+    ./build/examples/hello_world_plugin/hello_world_plugin
+    ```
 
-### 4. Agentic Management (MCP)
-An integrated **Model Context Protocol (MCP)** server allows AI agents to monitor hardware health, visualize load, and manage worker processes via standard tool calls.
+## Testing
 
-## Quick Start (Linux/WSL)
+The project includes a comprehensive suite of real-time safety and integrity tests:
 
-### Hardware Requirements
-- **Vulkan-capable GPU**: Any modern NVIDIA, AMD, or Intel GPU with Vulkan 1.2+ support.
-- **Verification**: Run `vulkaninfo --summary` to ensure your hardware is detected.
-- **Other Processors**: Support for NPUs and DSP arrays requires vendor-specific firmware (see `docs/INSTALL.md`).
+- `test_audio_loopback`: Validates bit-perfect integrity of the IPC buffers.
+- `test_control_simulacrum`: Verifies real-time parameter modulation.
+- `simulation_crash`: Tests the supervisor's ability to handle worker failures.
 
-### Prerequisites
-- Linux Kernel 5.x+
-- PipeWire dev headers (`libpipewire-0.3-dev`)
-- Vulkan SDK
-- Node.js (for MCP management)
-
-### Installation & Test
-...
-...
-## Contributing
-
-Contributions are what make the open source community such an amazing place to learn, inspire, and create.
-1. Read our [**Developer's Guide**](docs/DEVELOPER_GUIDE.md).
-2. Fork the Project.
-3. Create your Feature Branch (`git checkout -b feature/AmazingFeature`).
-4. Commit your Changes (`git commit -m 'Add some AmazingFeature'`).
-5. Push to the Branch (`git push origin feature/AmazingFeature`).
-6. Open a Pull Request.
-
-## Licensing
-...
-
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
-
-## Roadmap
-- [ ] Finalize FD-passing handshake.
-- [ ] Implement Convolution Reverb Shader.
-- [ ] Add real-time GUI/Monitoring dashboard.
+## License
+The SDK implementation is licensed under the **MIT License**. The core system and daemon are licensed under **GPLv3**.

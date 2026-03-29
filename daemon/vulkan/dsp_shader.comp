@@ -1,48 +1,88 @@
 #version 450
 
-// Il layout di esecuzione locale: la GPU processerà l'audio a blocchi paralleli di 64 sample alla volta per Compute Unit.
-layout (local_size_x = 64) in;
+layout(local_size_x = 64) in;
 
-// Il nostro RingBuffer mappato direttamente nella RAM della Scheda Video (SSBO)
-// Eseguiamo i calcoli "In-Place" per evitare un buffer in più e raddoppiare la latenza
-layout(set = 0, binding = 0) buffer AudioBuffer {
+layout(std430, binding = 0) buffer AudioBuffer {
     float samples[];
 };
 
-// "Push Constants": Parametri inviati diretti ai registri GPU senza allocare memoria.
-// Molto più veloci! Utili per controlli in tempo reale (automazioni DAW, gain, preset)
-layout(push_constant) uniform PushConstants {
-    uint frame_count;
-    float global_gain;
-    float soft_clip_threshold;
+// Binding 1: Persistent state per instance (e.g., history for filters)
+layout(std430, binding = 1) buffer StateBuffer {
+    float history[]; // [ch0_last, ch1_last, ..., ch7_last]
+};
+
+layout(push_constant) uniform Params {
+    float frame_count;
+    float gain;
+    float threshold;
+    float param1; // Cutoff / Mix
+    float param2; // Resonance / Feedback
+    uint  algo_id; // 0: Gain, 1: Wavefolder, 2: Resonators, 3: Stateful LPF
 } params;
 
-//---------------------------------------------------------
-// COMPUTE SHADER KERNEL (Vero motore DSP Hardware)
-//---------------------------------------------------------
+#define PI 3.14159265359
+
 void main() {
-    // ID univoco del core GPU che sta eseguendo questa singola istanza (es. Core N. 1024)
-    uint index = gl_GlobalInvocationID.x;
-    
-    // Safety check: evita Buffer Overflows se la DAW invia buffer non multipli di 64
-    if(index >= params.frame_count) {
-        return;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(params.frame_count)) return;
+
+    float in_sample = samples[i];
+    float out_sample = 0.0;
+
+    if (params.algo_id == 0) {
+        // --- MODE 0: GAIN & SOFT CLIP ---
+        out_sample = in_sample * params.gain;
+    } 
+    else if (params.algo_id == 1) {
+        // --- MODE 1: WAVEFOLDER (Heavy Harmonic Distortion) ---
+        float drive = params.param1 * 5.0;
+        out_sample = in_sample * params.gain * drive;
+        // Wavefolding loop
+        for(int j = 0; j < 4; j++) {
+            out_sample = abs(fract(out_sample * 0.25 + 0.5) * 4.0 - 2.0) - 1.0;
+        }
+    }
+    else if (params.algo_id == 2) {
+        // --- MODE 2: HEAVY REVERB SIM (Resonator Bank) ---
+        // Simulates a heavy reverb load by calculating 32 parallel 
+        // comb-filter like resonators per sample.
+        float mix = params.param1;
+        float decay = params.param2;
+        float reverb_acc = 0.0;
+        
+        for (int j = 0; j < 32; j++) {
+            // Sine-based resonance bank (computationally expensive)
+            float freq = 100.0 + (float(j) * 150.0);
+            float phase = float(i) * freq * (1.0 / 48000.0);
+            reverb_acc += sin(phase * PI * 2.0) * in_sample * decay;
+        }
+        
+        out_sample = (in_sample * (1.0 - mix)) + (reverb_acc * mix * 0.1);
+    }
+    else if (params.algo_id == 3) {
+        // --- MODE 3: STATEFUL ONE-POLE LPF ---
+        // We process sample by sample, but we need the previous output.
+        // Note: For parallel execution, this simplified model works if 
+        // we treat history as the value from the PREVIOUS block.
+        float alpha = params.param1; // Smoothing factor
+        uint ch = i / 256; // Identify channel based on stride
+        
+        // Read history from Binding 1
+        float prev = history[ch];
+        
+        // Simple low pass: y[n] = alpha * x[n] + (1-alpha) * y[n-1]
+        out_sample = (alpha * in_sample) + ((1.0 - alpha) * prev);
+        
+        // Update history for the next thread or next block
+        // In a real IIR, threads must be synchronized or sequential per channel.
+        history[ch] = out_sample; 
     }
 
-    // 1. Lettura dal Bus Hardware (VRAM/GTTRAM)
-    float sample = samples[index];
-    
-    // 2. DSP Algorithm
-    // A questo punto il limite è l'immaginazione. Applichiamo un Gain...
-    sample *= params.global_gain;
-    
-    // ...e una curva di Saturazione Pura / Soft Clipping ultraveloce
-    if (sample > params.soft_clip_threshold) {
-        sample = params.soft_clip_threshold + (sample - params.soft_clip_threshold) / (1.0 + pow((sample - params.soft_clip_threshold), 2.0));
-    } else if (sample < -params.soft_clip_threshold) {
-        sample = -params.soft_clip_threshold - (-sample - params.soft_clip_threshold) / (1.0 + pow((-sample - params.soft_clip_threshold), 2.0));
+    // Global Saturation Stage (Anti-Aliasing Soft Clip)
+    float saturated = out_sample;
+    if (abs(out_sample) > params.threshold) {
+        saturated = params.threshold * tanh(out_sample / params.threshold);
     }
-    
-    // 3. Scrittura del risultato ri-pompato indietro alla memoria visibile dal Plugin (Host)
-    samples[index] = sample;
+
+    samples[i] = saturated;
 }

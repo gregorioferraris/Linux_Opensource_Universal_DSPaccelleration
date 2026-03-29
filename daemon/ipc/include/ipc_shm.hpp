@@ -14,11 +14,15 @@ constexpr size_t CACHE_LINE_SIZE = 64;
 // Fix #5: DspAudioFrame supports up to 256 frames per block, 8 channels.
 // frame_count and channel_count indicate how many are valid.
 struct DspAudioFrame {
-    float    samples[256 * 8]; // max 256 frames * 8 channels
+    uint32_t instance_id;      // Unique ID for the plugin instance (for state persistence)
     uint32_t frame_count;      // actual number of frames in this block
     uint32_t channel_count;    // actual number of channels
+    uint32_t reserved_align;   // Explicit padding to ensure 8-byte alignment for next member
+    uint64_t timestamp_ns;     // Telemetry: entry time into the pipeline
+    float    samples[256 * 8]; // max 256 frames * 8 channels (Large buffer moved for better alignment)
+    uint8_t  padding[40];      // Adjusted padding to reach exactly 8256 bytes (64 * 129)
 };
-static_assert(std::is_trivially_copyable_v<DspAudioFrame>);
+static_assert(sizeof(DspAudioFrame) % CACHE_LINE_SIZE == 0);
 
 /**
  * @brief Lock-free Single-Producer Single-Consumer (SPSC) Ring Buffer.
@@ -37,6 +41,29 @@ public:
     ShmSPSCRingBuffer() = default;
     ShmSPSCRingBuffer(const ShmSPSCRingBuffer&) = delete;
     ShmSPSCRingBuffer& operator=(const ShmSPSCRingBuffer&) = delete;
+
+    T* peek_read() {
+        auto current_head = head_.load(std::memory_order_relaxed);
+        if (current_head == tail_.load(std::memory_order_acquire)) return nullptr;
+        return &data_[current_head];
+    }
+
+    void commit_read() {
+        auto current_head = head_.load(std::memory_order_relaxed);
+        head_.store((current_head + 1) % Capacity, std::memory_order_release);
+    }
+
+    T* reserve_write() {
+        auto current_tail = tail_.load(std::memory_order_relaxed);
+        auto next_tail = (current_tail + 1) % Capacity;
+        if (next_tail == head_.load(std::memory_order_acquire)) return nullptr;
+        return &data_[current_tail];
+    }
+
+    void commit_write() {
+        auto current_tail = tail_.load(std::memory_order_relaxed);
+        tail_.store((current_tail + 1) % Capacity, std::memory_order_release);
+    }
 
     bool push(const T& item) {
         auto current_tail = tail_.load(std::memory_order_relaxed);
@@ -88,7 +115,7 @@ struct WorkerControlBlock {
     std::atomic<bool>     should_restart;  // Set by supervisor to request restart
     std::atomic<bool>     bypass_zero_copy;// Toggle for low-latency bypass (0-copy)
     std::atomic<uint32_t> load_pct;        // 0-100 current GPU/HW load
-    uint8_t               padding[31];      // Align to cache line
+    uint8_t               padding[44];      // Align structure to 64-byte cache line
 };
 static_assert(sizeof(WorkerControlBlock) == CACHE_LINE_SIZE);
 
@@ -126,6 +153,16 @@ struct DspMemoryResponse {
 };
 static_assert(std::is_trivially_copyable_v<DspMemoryResponse>);
 
+/**
+ * @brief Log event from worker to SDK for deep diagnostics.
+ */
+struct DspLogEntry {
+    uint32_t level;     // 0: Info, 1: Warn, 2: Error
+    char     tag[16];   // e.g., "VULKAN", "NPU"
+    char     msg[128];
+};
+static_assert(std::is_trivially_copyable_v<DspLogEntry>);
+
 struct DspSharedMemory {
     WorkerControlBlock workers[8]; // Support up to 8 independent hardware workers
     ShmSPSCRingBuffer<DspAudioFrame, IPC_QUEUE_DEPTH> in_queue;   // plugin  → daemon
@@ -140,11 +177,14 @@ struct DspSharedMemory {
     // Memory Response Bus: daemon → plugin (Return handles/errors)
     ShmSPSCRingBuffer<DspMemoryResponse, 32> memory_response_bus;
 
+    // Logging Bus: worker → plugin (Diagnostics)
+    ShmSPSCRingBuffer<DspLogEntry, 32> log_bus;
+
     // Staging area for VRAM uploads (4MB)
     uint8_t           data_staging[1024 * 1024 * 4];
 
     std::atomic<bool> prefer_block_parallel; // Plugin toggle for GPU fragmentation
-    uint8_t           padding[31];           // Adjust padding
+    uint8_t           padding[55];           // Align structure to 64-byte boundary
 };
 
 } // namespace Ipc

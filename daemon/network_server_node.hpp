@@ -1,8 +1,10 @@
 #pragma once
 #include "compute_backend.hpp"
-#include "../Linux_DSP_accelleration.hpp"
+#include "../Linux_DSP_acceleration.hpp"
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <chrono>
+#include <cstring>
 #include <unistd.h>
 
 namespace DspAccel {

@@ -93,8 +93,8 @@ Located in your Antigravity app data folder (usually `~/.gemini/antigravity/`):
 {
   "mcpServers": {
     "engram": {
-      "command": "C:\\Users\\<user>\\.bin\\engram.exe",
-      "args": ["mcp", "--tools=agent"]
+      "command": "C:/Users/<IL_TUO_UTENTE>/.bin/engram.exe",
+      "args": ["mcp", "--tools=agent", "--db=./engram_db.json"]
     },
     "github": {
       "command": "npx",

@@ -11,7 +11,6 @@
  * NOTE: On non-Linux platforms this header no-ops gracefully.
  */
 
-#pragma once
 #include "../../../sdk/platform/platform_defs.h"
 #include <stdint.h>
 #include <stdbool.h>

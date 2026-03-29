@@ -6,10 +6,10 @@
 #include <type_traits>
 
 namespace DspAccel {
-namespace Ipc {
+namespace Ipc { // Root namespace for Inter-Process Communication
 
 /**
- * @brief Protocollo per la comunicazione con host DSP esterni.
+ * @brief Network protocol for external DSP host communication (v2.0 Ready).
  */
 namespace Network {
     enum class PacketType : uint32_t {
@@ -21,7 +21,7 @@ namespace Network {
     };
 
     struct NetPacketHeader {
-        uint32_t magic;         // Identificativo 'DSPA' (0x44535041)
+        uint32_t magic;         // Identifier 'DSPA' (0x44535041)
         PacketType type;
         uint32_t sequence_id;   // Per gestire l'ordine dei pacchetti UDP
         uint32_t payload_size;
@@ -33,6 +33,9 @@ namespace Network {
 
 // Cache line size to avoid false sharing
 constexpr size_t CACHE_LINE_SIZE = 64;
+
+// Maximum latency target for v1.0 (Mixing): 256 samples.
+// v2.0 (Tracking) will target smaller buffers (16-32).
 
 // Fix #5: DspAudioFrame supports up to 256 frames per block, 8 channels.
 // frame_count and channel_count indicate how many are valid.
@@ -49,6 +52,7 @@ static_assert(std::is_trivially_copyable_v<DspAudioFrame>);
  */
 template <typename T, size_t Capacity>
 class ShmSPSCRingBuffer {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of two for performance");
     static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable for shared memory");
     static_assert(std::atomic<size_t>::is_always_lock_free, "std::atomic<size_t> must be lock-free for RT audio safe IPC");
 
@@ -63,7 +67,7 @@ public:
 
     bool push(const T& item) {
         auto current_tail = tail_.load(std::memory_order_relaxed);
-        auto next_tail = (current_tail + 1) % Capacity;
+        auto next_tail = (current_tail + 1) & (Capacity - 1);
         if (next_tail == head_.load(std::memory_order_acquire)) {
             return false; // Queue is full -> XRUN
         }
@@ -78,7 +82,7 @@ public:
             return false; // Queue is empty
         }
         out_item = data_[current_head];
-        head_.store((current_head + 1) % Capacity, std::memory_order_release);
+        head_.store((current_head + 1) & (Capacity - 1), std::memory_order_release);
         return true;
     }
 
@@ -149,7 +153,7 @@ struct DspMemoryResponse {
 };
 static_assert(std::is_trivially_copyable_v<DspMemoryResponse>);
 
-struct DspSharedMemory {
+struct DspSharedMemory { // Main SHM structure for v1.0 Security
     WorkerControlBlock workers[8]; // Support up to 8 independent hardware workers
     ShmSPSCRingBuffer<DspAudioFrame, IPC_QUEUE_DEPTH> in_queue;   // plugin  → daemon
     ShmSPSCRingBuffer<DspAudioFrame, IPC_QUEUE_DEPTH> out_queue;  // daemon  → plugin

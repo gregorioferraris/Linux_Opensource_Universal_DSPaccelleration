@@ -8,6 +8,7 @@ include_directories(../)
 add_executable(test_core test_core.cpp)
 add_executable(simulation_crash simulation_crash.cpp)
 add_executable(test_control_simulacrum test_control_simulacrum.cpp)
+add_executable(test_audio_loopback test_audio_loopback.cpp)
 
 # Output tests in the main build folder
-set_target_properties(test_core simulation_crash test_control_simulacrum PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set_target_properties(test_core simulation_crash test_control_simulacrum test_audio_loopback PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

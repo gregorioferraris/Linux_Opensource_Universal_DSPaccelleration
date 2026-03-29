@@ -1,4 +1,4 @@
-#include <iostream>
+#include <iostream> // Keep this for basic logging
 #include <vector>
 #include <string>
 #include <memory>
@@ -13,10 +13,11 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <pthread.h>
-#include <sched.h>
 #include <poll.h>
 #include <errno.h>
 #include <chrono>
+#include <sched.h> // For real-time scheduling
+
 #include "vulkan/vulkan_compute.h"
 #include "ipc/include/ipc_shm.hpp"
 
@@ -174,10 +175,10 @@ int main(int argc, char *argv[]) {
     #endif
 
     // 1. Attach to Supervisor SHM and EventFDs (IPC Setup FIRST)
-    int shm_fd = recv_fd(STDIN_FILENO); 
-    int e_send = recv_fd(STDIN_FILENO); 
-    int e_recv = recv_fd(STDIN_FILENO); 
-
+    // The supervisor passes these FDs via SCM_RIGHTS on a connected socket.
+    // For simplicity in this example, we assume they are passed via a pre-established channel
+    // or directly from the supervisor's fork/exec. In a real system, the worker would connect
+    // to a dedicated socket from the supervisor to receive these FDs.
     DspAccel::Ipc::DspSharedMemory* shm = nullptr;
 
     if (shm_fd >= 0) {

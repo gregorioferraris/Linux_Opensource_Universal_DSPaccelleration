@@ -12,7 +12,7 @@ int main() {
     printf("--- DSP Accel: Hello World Plugin ---\n");
 
     // 1. Connect to the Supervisor (requesting GPU/Parallel acceleration)
-    dsp_accel_sdk_ctx_t *ctx = dsp_accel_sdk_connect(DSP_TYPE_MASSIVELY_PARALLEL, 10.0f);
+    dsp_accel_sdk_ctx_t *ctx = dsp_accel_sdk_connect(DSP_ACCEL_TYPE_MASSIVELY_PARALLEL, 10.0f);
     
     if (!ctx) {
         printf("Failed to connect to DSP Supervisor. Falling back to CPU.\n");

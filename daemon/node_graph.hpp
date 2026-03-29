@@ -16,6 +16,7 @@ class DspNodeGraph {
         IDspNode* to;
     };
 
+    std::vector<Connection> connections_;
     std::vector<IDspNode*> execution_order_;
     IDspNode* last_failed_node_ = nullptr;
 

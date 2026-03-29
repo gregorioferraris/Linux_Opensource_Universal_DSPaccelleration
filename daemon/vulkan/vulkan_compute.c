@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 struct dsp_vulkan_buffer {
     VkBuffer buffer;
@@ -18,6 +19,9 @@ struct dsp_vulkan_context {
     VkQueue compute_queue;
     uint32_t queue_family_index;
     
+    VkDescriptorSetLayout descriptor_set_layout;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSet descriptor_set;
     VkCommandPool command_pool;
     
     VkShaderModule shader_module;
@@ -29,17 +33,22 @@ struct dsp_vulkan_context {
 };
 
 // Helper to open and read the SPIR-V shader binary
-static char* read_spv(const char* filename, size_t* out_size) {
+static uint32_t* read_spv(const char* filename, size_t* out_size) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
         printf("[Vulkan API] ERROR: Cannot open shader file %s\n", filename);
         return NULL;
     }
     fseek(file, 0, SEEK_END);
-    *out_size = ftell(file);
+    long size = ftell(file);
     fseek(file, 0, SEEK_SET);
-    char* buffer = malloc(*out_size);
-    if(buffer) fread(buffer, 1, *out_size, file);
+    
+    // Vulkan requires pCode to be 4-byte aligned and size in bytes
+    uint32_t* buffer = malloc(size); 
+    if(buffer) {
+        fread(buffer, 1, size, file);
+        *out_size = (size_t)size;
+    }
     fclose(file);
     return buffer;
 }
@@ -116,7 +125,7 @@ struct dsp_vulkan_context* dsp_vulkan_init(int device_index) {
     VkQueueFamilyProperties* queueFamilies = malloc(sizeof(VkQueueFamilyProperties) * queueFamilyCount);
     vkGetPhysicalDeviceQueueFamilyProperties(ctx->physical_device, &queueFamilyCount, queueFamilies);
 
-    ctx->queue_family_index = -1;
+    ctx->queue_family_index = 0xFFFFFFFF;
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
         if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             ctx->queue_family_index = i;
@@ -179,22 +188,21 @@ struct dsp_vulkan_context* dsp_vulkan_init(int device_index) {
 #endif
 
     size_t spv_size = 0;
-    char* spv_code = read_spv(spv_path, &spv_size);
-    if(spv_code) {
+    uint32_t* code_ptr = read_spv(spv_path, &spv_size);
+    if(code_ptr) {
         VkShaderModuleCreateInfo createShaderInfo = {0};
         createShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         createShaderInfo.codeSize = spv_size;
-        createShaderInfo.pCode = (const uint32_t*)spv_code;
+        createShaderInfo.pCode = code_ptr;
         
         vkCreateShaderModule(ctx->device, &createShaderInfo, NULL, &ctx->shader_module);
-        free(spv_code);
-        printf("[Vulkan API] Compilato e caricato Compute Shader (%zu bytes) da disco.\n", spv_size);
+        free(code_ptr);
         
         // 7. Pipeline Layout (Push Constants for DSP params injection)
         VkPushConstantRange push_constant = {0};
         push_constant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push_constant.offset = 0;
-        push_constant.size = 12; // frame_count(4) + global_gain(4) + soft_clip_threshold(4)
+        push_constant.size = 24; // Expanded for algo_id and params
         
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {0};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -202,9 +210,52 @@ struct dsp_vulkan_context* dsp_vulkan_init(int device_index) {
         pipelineLayoutInfo.pPushConstantRanges = &push_constant;
         
         vkCreatePipelineLayout(ctx->device, &pipelineLayoutInfo, NULL, &ctx->pipeline_layout);
+
+        // 8. Create Compute Pipeline (Missing in previous version)
+        VkComputePipelineCreateInfo pipelineInfo = {0};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = ctx->shader_module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = ctx->pipeline_layout;
+
+        vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &ctx->compute_pipeline);
+
+        // 9. Descriptor Set Layout (For Audio and State buffers)
+        VkDescriptorSetLayoutBinding bindings[2] = {0};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo descriptorLayout = {0};
+        descriptorLayout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        descriptorLayout.bindingCount = 2;
+        descriptorLayout.pBindings = bindings;
+        vkCreateDescriptorSetLayout(ctx->device, &descriptorLayout, NULL, &ctx->descriptor_set_layout);
+
+        // 10. Descriptor Pool & Set
+        VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo poolCreateInfo = {0};
+        poolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolCreateInfo.maxSets = 1;
+        poolCreateInfo.poolSizeCount = 1;
+        poolCreateInfo.pPoolSizes = &poolSize;
+        vkCreateDescriptorPool(ctx->device, &poolCreateInfo, NULL, &ctx->descriptor_pool);
+
+        VkDescriptorSetAllocateInfo setAllocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        setAllocInfo.descriptorPool = ctx->descriptor_pool;
+        setAllocInfo.descriptorSetCount = 1;
+        setAllocInfo.pSetLayouts = &ctx->descriptor_set_layout;
+        vkAllocateDescriptorSets(ctx->device, &setAllocInfo, &ctx->descriptor_set);
     }
 
-    printf("[Vulkan API] GPU Dispatch Engine Pronto all'uso!\n");
     return ctx;
 }
 
@@ -213,6 +264,9 @@ void dsp_vulkan_destroy(struct dsp_vulkan_context *ctx) {
     if (ctx->device) {
         if(ctx->pipeline_layout) vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
         if(ctx->shader_module) vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
+        if(ctx->compute_pipeline) vkDestroyPipeline(ctx->device, ctx->compute_pipeline, NULL);
+        if(ctx->descriptor_pool) vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
+        if(ctx->descriptor_set_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_set_layout, NULL);
         if(ctx->command_pool) vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
         vkDestroyDevice(ctx->device, NULL);
     }
@@ -221,29 +275,69 @@ void dsp_vulkan_destroy(struct dsp_vulkan_context *ctx) {
     printf("[Vulkan API] Contesto Vulkan distrutto in modo sicuro.\n");
 }
 
-bool dsp_vulkan_dispatch(struct dsp_vulkan_context *ctx, float* buffer, uint32_t frames, uint32_t channels) {
-    if (!ctx || !buffer) return false;
-    
-    // Hardware dispatch process (Placeholder for memory mapped write and flush):
-    // - Map memory segment on VRAM
-    // - Copy buffer 
-    // - Update PushConstants for params
-    // - vkCmdDispatch(Command Buffer, frames/64 + 1)
-    // - Hardware waits under X milliseconds (via Fence)
+bool dsp_vulkan_dispatch(struct dsp_vulkan_context *ctx, float* buffer, uint32_t frames, uint32_t channels, float gain, float threshold, float p1, float p2, uint32_t algo, uint32_t state_handle) {
+    if (!ctx) return false;
+
+    // Implementation for Dispatching Audio
+    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = ctx->command_pool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // Bind Pipeline & Descriptors
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->compute_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline_layout, 0, 1, &ctx->descriptor_set, 0, NULL);
+
+    // Pass params (frames, gain, threshold) via Push Constants
+    float params[6] = { (float)frames, gain, threshold, p1, p2, (float)algo };
+    vkCmdPushConstants(cmd, ctx->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), params);
+
+    // Dispatch GPU Threads: Ensure we cover all samples (frames * channels)
+    uint32_t total_samples = frames * channels;
+    vkCmdDispatch(cmd, (total_samples + 63) / 64, 1, 1);
+
+    vkEndCommandBuffer(cmd);
+
+    // Submission
+    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    VkFence fence;
+    VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(ctx->device, &fenceInfo, NULL, &fence);
+
+    if (vkQueueSubmit(ctx->compute_queue, 1, &submitInfo, fence) != VK_SUCCESS) {
+        vkDestroyFence(ctx->device, fence, NULL);
+        vkFreeCommandBuffers(ctx->device, ctx->command_pool, 1, &cmd);
+        return false;
+    }
+
+    // Wait with a 2ms timeout (Real-time safety)
+    vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, 2000000);
+    vkDestroyFence(ctx->device, fence, NULL);
+    vkFreeCommandBuffers(ctx->device, ctx->command_pool, 1, &cmd);
 
     return true;
 }
 
 // Memory Type Helper
-static uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+static int32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(physical_device, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
         if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
+            return (int32_t)i;
         }
     }
-    return -1;
+    return -1; // Ritorna signed per gestire l'errore
 }
 
 uint32_t dsp_vulkan_allocate_buffer(struct dsp_vulkan_context *ctx, size_t size) {
@@ -274,8 +368,21 @@ uint32_t dsp_vulkan_allocate_buffer(struct dsp_vulkan_context *ctx, size_t size)
     VkMemoryAllocateInfo allocInfo = {0};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = find_memory_type(ctx->physical_device, memReqs.memoryTypeBits, 
-                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // Host visible for simple uploads in Alpha
+    
+    // Cerchiamo memoria DEVICE_LOCAL + HOST_VISIBLE per semplicità in Alpha.
+    // Se non disponibile, facciamo fallback su HOST_VISIBLE.
+    int32_t memType = find_memory_type(ctx->physical_device, memReqs.memoryTypeBits, 
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                                       
+    if (memType < 0) {
+        memType = find_memory_type(ctx->physical_device, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    }
+
+    if (memType < 0) {
+        printf("[Vulkan API] ERROR: No compatible memory type found\n");
+        return 0;
+    }
+    allocInfo.memoryTypeIndex = (uint32_t)memType;
 
     if (vkAllocateMemory(ctx->device, &allocInfo, NULL, &ctx->user_buffers[handle].memory) != VK_SUCCESS) {
         vkDestroyBuffer(ctx->device, ctx->user_buffers[handle].buffer, NULL);
@@ -363,12 +470,31 @@ uint32_t dsp_vulkan_import_shm(struct dsp_vulkan_context *ctx, int fd, size_t si
     return handle;
 }
 
-bool dsp_vulkan_dispatch_zero_copy(struct dsp_vulkan_context *ctx, uint32_t handle, uint32_t offset, uint32_t frames, uint32_t channels) {
+bool dsp_vulkan_dispatch_zero_copy(struct dsp_vulkan_context *ctx, uint32_t handle, uint32_t offset, uint32_t frames, uint32_t channels, float gain, float threshold, float p1, float p2, uint32_t algo, uint32_t state_handle) {
     if (!ctx || !ctx->user_buffers[handle].active) return false;
     
-    // In a production implementation, we would update Descriptor Sets here 
-    // to point to user_buffers[handle].buffer with the given offset.
-    // For this Alpha, we log the bypass activation.
-    
-    return true; 
+    // Aggiorniamo i Descriptor per Audio (Binding 0) e Stato (Binding 1)
+    VkDescriptorBufferInfo bInfo[2] = {0};
+    bInfo[0].buffer = ctx->user_buffers[handle].buffer;
+    bInfo[0].offset = offset;
+    bInfo[0].range = frames * channels * sizeof(float);
+
+    bInfo[1].buffer = ctx->user_buffers[state_handle].buffer;
+    bInfo[1].offset = 0;
+    bInfo[1].range = ctx->user_buffers[state_handle].size;
+
+    VkWriteDescriptorSet dWrite[2] = {0};
+    for(int i=0; i<2; i++) {
+        dWrite[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        dWrite[i].dstSet = ctx->descriptor_set;
+        dWrite[i].dstBinding = i;
+        dWrite[i].descriptorCount = 1;
+        dWrite[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        dWrite[i].pBufferInfo = &bInfo[i];
+    }
+
+    vkUpdateDescriptorSets(ctx->device, 2, dWrite, 0, NULL);
+
+    // Ora possiamo lanciare il dispatch standard usando il buffer aggiornato
+    return dsp_vulkan_dispatch(ctx, (float*)1, frames, channels, gain, threshold, p1, p2, algo, state_handle);
 }

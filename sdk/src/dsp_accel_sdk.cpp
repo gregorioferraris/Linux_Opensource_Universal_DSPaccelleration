@@ -15,13 +15,17 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <chrono>
 #include <stdint.h>
+#include <errno.h>
+#include <poll.h>
 
 #ifdef DSP_PLATFORM_LINUX
 #include <sys/eventfd.h>
 #endif
 
-#define DSP_DAEMON_SOCKET_PATH "/run/dsp_accel/daemon.sock"
+#define DSP_DAEMON_SOCKET_PATH "/tmp/dsp_accel_daemon.sock"
 #define DSP_LATENCY_FRAMES     64
 
 // ─── Opaque Context ───────────────────────────────────────────────────────────
@@ -34,12 +38,18 @@ struct dsp_accel_sdk_ctx {
     DspAccel::Ipc::DspSharedMemory *shm; // mmap pointer
     uint32_t worker_id;        // Assigned by daemon (0-7)
 
+    // Watchdog tracking
+    uint64_t last_worker_heartbeat;
+    uint32_t heartbeat_stalled_count; // Number of blocks without HW progress
+
     DspWorkloadType workload_type;
     float    cost_mflops;
 
     // Stats
     uint32_t dispatched_blocks;
     uint32_t xrun_count;
+    double   total_roundtrip_ns;
+    float    last_measured_rtt_us;
 };
 
 // ─── Helper: receive exactly one FD via SCM_RIGHTS ───────────────────────────
@@ -115,6 +125,16 @@ dsp_accel_sdk_ctx_t* dsp_accel_sdk_connect(DspWorkloadType type, float cost_mflo
         goto cleanup;
     }
 
+    // v1.0 Security: Verify that the daemon has sealed the memfd.
+    // This prevents any process from resizing the SHM, which would cause segfaults.
+#ifdef F_GET_SEALS
+    int seals = fcntl(ctx->shm_fd, F_GET_SEALS);
+    if (seals >= 0 && !(seals & F_SEAL_SHRINK)) {
+        fprintf(stderr, "[DSP SDK] WARNING: SHM is not sealed. Security risk detected.\n");
+        // In production, we might want to fail here.
+    }
+#endif
+
     // Map the full DspSharedMemory struct (two ring buffers)
     ctx->shm = (DspAccel::Ipc::DspSharedMemory*)mmap(
         NULL, sizeof(DspAccel::Ipc::DspSharedMemory),
@@ -122,6 +142,10 @@ dsp_accel_sdk_ctx_t* dsp_accel_sdk_connect(DspWorkloadType type, float cost_mflo
         ctx->shm_fd, 0
     );
     if (ctx->shm == MAP_FAILED) { ctx->shm = NULL; goto cleanup; }
+
+    // Initialize watchdog with current heartbeat
+    ctx->last_worker_heartbeat = ctx->shm->workers[ctx->worker_id].heartbeat.load(std::memory_order_acquire);
+    ctx->heartbeat_stalled_count = 0;
 
     fprintf(stderr, "[DSP SDK] Connected! Hardware path active (type=%d).\n", type);
     return ctx;
@@ -146,26 +170,62 @@ bool dsp_accel_sdk_dispatch(dsp_accel_sdk_ctx_t *ctx,
     if (!ctx || !ctx->shm) return false;
 
 #ifdef DSP_PLATFORM_LINUX
+    // Check for worker health before dispatching
+    auto last_err = ctx->shm->workers[ctx->worker_id].last_error.load(std::memory_order_acquire);
+    if (last_err != DspAccel::Ipc::WorkerError::NONE) {
+        fprintf(stderr, "[DSP SDK] Worker error %d detected. Falling back to CPU.\n", (int)last_err);
+        return false; // Trigger immediate CPU fallback
+    }
+
+    // Watchdog check: verify worker heartbeat is incrementing.
+    // This handles cases where the process is alive but the hardware loop is stuck.
+    uint64_t current_hb = ctx->shm->workers[ctx->worker_id].heartbeat.load(std::memory_order_acquire);
+    if (current_hb == ctx->last_worker_heartbeat) {
+        ctx->heartbeat_stalled_count++;
+    } else {
+        ctx->last_worker_heartbeat = current_hb;
+        ctx->heartbeat_stalled_count = 0;
+    }
+
+    // Threshold: ~10 blocks (approx 20-100ms depending on buffer size)
+    if (ctx->heartbeat_stalled_count > 10) { 
+        return false; // Worker is zombie, fallback to CPU
+    }
+
     // Fix #5: clamp to DspAudioFrame maximums (256 frames x 8 channels)
     uint32_t fc = (uint32_t)(frames  > 256 ? 256 : frames);
     uint32_t cc = (uint32_t)(channels >  8  ?  8 : channels);
 
-    DspAccel::Ipc::DspAudioFrame frame_in = {};
-    frame_in.frame_count   = fc;
-    frame_in.channel_count = cc;
-    for (uint32_t ch = 0; ch < cc; ch++)
-        memcpy(&frame_in.samples[ch * 256], channel_buffers[ch], fc * sizeof(float));
-
-    // Fix #2: use SPSC push() — RT-safe, no direct indexing
-    if (!ctx->shm->in_queue.push(frame_in)) {
+    // Zero-Copy: Reserve a slot directly in shared memory to avoid local stack copy
+    DspAccel::Ipc::DspAudioFrame* slot = ctx->shm->in_queue.reserve_write();
+    if (!slot) {
         ctx->xrun_count++;
         fprintf(stderr, "[DSP SDK] XRUN: in_queue full!\n");
         return false;
     }
 
+    slot->frame_count   = fc;
+    slot->channel_count = cc;
+    
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    slot->timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+    for (uint32_t ch = 0; ch < cc; ch++) {
+        float* __restrict dest = &slot->samples[ch * 256];
+        const float* __restrict src = channel_buffers[ch];
+        memcpy(dest, src, fc * sizeof(float));
+    }
+
+    ctx->shm->in_queue.commit_write();
+
     // Signal daemon: audio is ready
     uint64_t one = 1;
-    if (write(ctx->eventfd_send, &one, sizeof(one)) < 0) {
+    ssize_t res;
+    do {
+        res = write(ctx->eventfd_send, &one, sizeof(one));
+    } while (res < 0 && errno == EINTR);
+
+    if (res < 0) {
         ctx->xrun_count++;
         return false;
     }
@@ -178,10 +238,6 @@ bool dsp_accel_sdk_dispatch(dsp_accel_sdk_ctx_t *ctx,
 }
 
 // ─── Readback: called after dispatch to copy output into DAW buffers ──────────
-// Fix #1: plugin reads output from out_queue (daemon writes here after GPU calc)
-#include <poll.h>
-
-// ... (in dsp_accel_sdk_read_output)
 bool dsp_accel_sdk_read_output(dsp_accel_sdk_ctx_t *ctx,
                                 float **channel_buffers,
                                 int frames, int channels)
@@ -191,22 +247,37 @@ bool dsp_accel_sdk_read_output(dsp_accel_sdk_ctx_t *ctx,
 #ifdef DSP_PLATFORM_LINUX
     // Fix #13: Use poll with 10ms timeout to avoid hanging the DAW
     struct pollfd pfd = { .fd = ctx->eventfd_recv, .events = POLLIN };
-    int ret = poll(&pfd, 1, 10); // 10ms timeout
+    int ret = poll(&pfd, 1, 5); // Tighter 5ms timeout for pro audio
     if (ret <= 0) {
         // Timeout or error: signal CPU fallback (returns false)
         return false;
     }
 
     uint64_t val = 0;
-    if (read(ctx->eventfd_recv, &val, sizeof(val)) < 0) return false;
+    ssize_t res;
+    do {
+        res = read(ctx->eventfd_recv, &val, sizeof(val));
+    } while (res < 0 && errno == EINTR);
 
-    DspAccel::Ipc::DspAudioFrame frame_out = {};
-    if (!ctx->shm->out_queue.pop(frame_out)) return false;
+    // Zero-Copy: Access the frame directly in SHM without intermediate copy
+    DspAccel::Ipc::DspAudioFrame* slot = ctx->shm->out_queue.peek_read();
+    if (!slot) return false;
 
-    uint32_t fc = frame_out.frame_count;
-    uint32_t cc = frame_out.channel_count;
+    // Calculate Round-Trip Telemetry
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    uint64_t end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    if (end_ns > slot->timestamp_ns) {
+        uint64_t rtt = end_ns - slot->timestamp_ns;
+        ctx->last_measured_rtt_us = (float)rtt / 1000.0f;
+        ctx->total_roundtrip_ns += (double)rtt;
+    }
+    
+    uint32_t fc = slot->frame_count;
+    uint32_t cc = slot->channel_count;
     for (uint32_t ch = 0; ch < cc && ch < (uint32_t)channels; ch++)
-        memcpy(channel_buffers[ch], &frame_out.samples[ch * 256], fc * sizeof(float));
+        memcpy(channel_buffers[ch], &slot->samples[ch * 256], fc * sizeof(float));
+
+    ctx->shm->out_queue.commit_read();
 
     return true;
 #else
@@ -225,8 +296,8 @@ bool dsp_accel_sdk_get_stats(dsp_accel_sdk_ctx_t *ctx, DspAccelStats *out) {
     if (!ctx || !out) return false;
     out->xrun_count        = ctx->xrun_count;
     out->dispatched_blocks = ctx->dispatched_blocks;
-    out->hw_load_percent   = 0.0f;
-    out->avg_roundtrip_us  = 0.0f;
+    out->hw_load_percent   = (float)ctx->shm->workers[ctx->worker_id].load_pct.load(std::memory_order_relaxed);
+    out->avg_roundtrip_us  = (ctx->dispatched_blocks > 0) ? (float)(ctx->total_roundtrip_ns / (double)ctx->dispatched_blocks / 1000.0) : 0.0f;
     return true;
 }
 
@@ -235,6 +306,19 @@ bool dsp_accel_sdk_set_param(dsp_accel_sdk_ctx_t* ctx, uint32_t param_id, float 
     
     DspAccel::Ipc::DspControlEvent event = { param_id, value };
     return ctx->shm->control_bus.push(event);
+}
+
+bool dsp_accel_sdk_fetch_log(dsp_accel_sdk_ctx_t* ctx, char* out_tag, char* out_msg, int* out_level) {
+    if (!ctx || !ctx->shm) return false;
+    
+    DspAccel::Ipc::DspLogEntry entry;
+    if (ctx->shm->log_bus.pop(entry)) {
+        if (out_level) *out_level = (int)entry.level;
+        if (out_tag) strncpy(out_tag, entry.tag, 15);
+        if (out_msg) strncpy(out_msg, entry.msg, 127);
+        return true;
+    }
+    return false;
 }
 
 // ─── VRAM Management (Asynchronous handshake) ──────────────────────────────

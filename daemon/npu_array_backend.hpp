@@ -31,7 +31,7 @@ public:
     DspNodeDescriptor get_descriptor() const override {
         return {
             .name = "NPU Array Engine #" + std::to_string(device_id_),
-            .type = DSP_TYPE_ARRAY_PROCESSOR,
+            .type = DSP_ACCEL_TYPE_ARRAY_PROCESSOR,
             .max_buffer_size = 4096,
             .supports_staging = true
         };

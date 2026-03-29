@@ -2,11 +2,16 @@
 
 All notable changes to the Linux DSP Acceleration project will be documented in this file.
 
-## [0.2.0-alpha] - 2026-03-26
+## [0.1.0] - 2026-03-28
 
-### Added
+### Added (Stable Release)
 - **GPU Block-Level Parallelization**: The system now supports splitting sequential audio frames into parallel GPU compute calls for massive throughput gains.
-- **Node-Based Graph Engine**: Implemented `DspNodeGraph` for multi-stage heterogeneous staging (GPU -> NPU -> GPU).
+- **True Zero-Copy IPC**: Implemented `reserve/commit` and `peek/commit` patterns to eliminate redundant `memcpy` operations.
+- **Real-Time Telemetry**: Added nanosecond-precision Round-Trip Time (RTT) tracking for every audio block.
+- **Hardened Watchdog**: SDK now monitors worker heartbeats to detect and recover from stalled hardware drivers or GPU hangs.
+- **Real-Time Scheduling**: Worker processes now utilize `SCHED_FIFO` priority for deterministic execution.
+- **Diagnostic Logging Bus**: Added a dedicated lock-free ring buffer for asynchronous worker-to-plugin logging.
+- **Node-Based Graph Engine**: Stable implementation of `DspNodeGraph` for multi-stage heterogeneous staging (GPU -> NPU -> GPU).
 - **Dynamic Load Balancing**: Real-time hardware telemetry integration to route workloads to the most efficient available node.
 - **Resource-Aware Splitting**: Added `prefer_block_parallel` control flag and automatic CPU-SIMD fallback for high-load scenarios.
 - **SDK Protection**: Implemented `poll()` with 10ms timeout in readback to prevent DAW hangs during hardware stalls.

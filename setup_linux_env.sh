@@ -7,7 +7,7 @@ echo "====================================================="
 
 echo "--- Installing build tools and dependencies ---"
 sudo apt update
-sudo apt install -y build-essential cmake ninja-build libpipewire-0.3-dev libspa-0.3-dev \
+sudo apt install -y build-essential cmake ninja-build pkg-config libpipewire-0.3-dev libspa-0.2-dev \
                      libvulkan-dev vulkan-tools glslang-tools nodejs npm
 
 echo "--- Verifying Vulkan installation ---"
@@ -24,13 +24,16 @@ fi
 
 echo "--- Preparing CLAP SDK ---"
 if [ ! -d "clap-sdk" ]; then
-    git clone https://github.com/free-audio/clap.git clap-sdk
+    git clone --depth 1 https://github.com/free-audio/clap.git clap-sdk
+else
+    echo "CLAP SDK already present, skipping clone."
 fi
 
 echo "--- Setup complete! ---"
 echo ""
 echo "To compile the project, run these commands inside the build directory:"
-echo "  mkdir -p build && cd build"
+echo "  # Da root del progetto:"
+echo "  mkdir -p build && cd build && rm -rf *"
 echo "  cmake -G Ninja .."
 echo "  ninja"
 echo ""

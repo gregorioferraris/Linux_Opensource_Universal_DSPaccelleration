@@ -4,16 +4,19 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unistd.h>
+#include <sys/uio.h>
 #include <thread>
-#include <map>
+#include <vector>
 #include <chrono>
 #include <atomic>
+#include <cstring>
 
 namespace DspAccel {
 namespace Daemon {
 
 /**
- * @brief Nodo DSP bidirezionale per comunicazione tra host e controller esterni.
+ * @brief Bidirectional DSP node for communication between host and external controllers.
  */
 class RemoteDspNode : public IDspNode {
     int socket_fd;
@@ -25,9 +28,11 @@ class RemoteDspNode : public IDspNode {
 
     // Jitter Buffer logic
     uint32_t expected_seq_id = 0;
-    std::map<uint32_t, Ipc::DspAudioFrame> reorder_buffer;
+    static constexpr size_t JITTER_WINDOW = 32;
+    Ipc::DspAudioFrame jitter_buffer[JITTER_WINDOW];
+    bool jitter_mask[JITTER_WINDOW] = {false};
 
-    // Meccanismo di clock sync
+    // Clock sync mechanism
     int64_t clock_offset_ns = 0;
     uint32_t current_sample_rate = 48000;
 
@@ -50,16 +55,16 @@ public:
         if (socket_fd < 0) return false;
         active = true;
         
-        // Avvia il thread di ricezione (per gestire il ritorno dell'audio elaborato)
+        // Start the reception thread (to handle processed audio return)
         rx_thread = std::thread(&RemoteDspNode::receive_loop, this);
         
-        // Invia un pacchetto di Handshake iniziale
+        // Send an initial Handshake packet
         send_packet(Ipc::Network::PacketType::HANDSHAKE, nullptr, 0);
         return true;
     }
 
     bool process_stage(Ipc::DspAudioFrame& frame) override {
-        // Invia il frame all'host esterno con timestamp del clock locale
+        // Send frame to external host with local clock timestamp
         return send_packet(Ipc::Network::PacketType::AUDIO_FRAME, &frame, sizeof(frame));
     }
 
@@ -99,29 +104,26 @@ public:
             if (header->magic != 0x44535041) continue;
 
             if (header->type == Ipc::Network::PacketType::AUDIO_FRAME && shm_ptr_) {
-                // Logica Jitter Buffer: inserimento ordinato
-                if (header->sequence_id >= expected_seq_id) {
-                    auto& frame_slot = reorder_buffer[header->sequence_id];
-                    memcpy(&frame_slot, 
-                           receive_buf.data() + sizeof(Ipc::Network::NetPacketHeader), 
-                           sizeof(Ipc::DspAudioFrame));
+                // Real-Time Safe Jitter Buffer Logic (Circular Array)
+                uint32_t slot = header->sequence_id % JITTER_WINDOW;
+                
+                // Safe sequence_id wrap-around management
+                int32_t diff = (int32_t)(header->sequence_id - expected_seq_id);
+                if (diff >= 0 && diff < (int32_t)JITTER_WINDOW) {
+                    memcpy(&jitter_buffer[slot], 
+                           receive_buf.data() + sizeof(Ipc::Network::NetPacketHeader), sizeof(Ipc::DspAudioFrame));
+                    jitter_mask[slot] = true;
                 }
 
-                // Svuota i pacchetti pronti in sequenza
-                while (reorder_buffer.count(expected_seq_id)) {
-                    if (!shm_ptr_->out_queue.push(reorder_buffer[expected_seq_id])) {
-                        // SHM Saturation
-                    }
-                    reorder_buffer.erase(expected_seq_id);
+                // Drain ready packets in sequence
+                while (jitter_mask[expected_seq_id % JITTER_WINDOW]) {
+                    uint32_t ready_slot = expected_seq_id % JITTER_WINDOW;
+                    shm_ptr_->out_queue.push(jitter_buffer[ready_slot]);
+                    jitter_mask[ready_slot] = false;
                     expected_seq_id++;
                 }
-
-                // Pulizia buffer se troppo grande (pacchetti persi)
-                if (reorder_buffer.size() > 16) {
-                    expected_seq_id = reorder_buffer.begin()->first;
-                }
             } else if (header->type == Ipc::Network::PacketType::CLOCK_SYNC) {
-                // Calcolo offset temporale tra le due macchine Linux
+                // Time offset calculation between the two Linux machines
                 auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                 clock_offset_ns = (int64_t)header->timestamp_ns - now;
             }
@@ -133,12 +135,12 @@ public:
         send_packet(Ipc::Network::PacketType::CONTROL_EVENT, &evt, sizeof(evt));
     }
 
-    // Metodi stub per la gestione memoria (l'host esterno gestisce la sua VRAM)
+    // Memory management stub methods (external host manages its own VRAM)
     uint32_t allocate_buffer(size_t s) override { return 0; }
     bool upload_buffer(uint32_t h, const void* d, size_t s) override { return true; }
     void free_buffer(uint32_t h) override {}
     void set_zero_copy_bypass(bool e, int f, size_t s) override {}
     void set_shm_ptr(void* p) override { shm_ptr_ = (Ipc::DspSharedMemory*)p; }
-    DspNodeDescriptor get_descriptor() const override { return {"External_Host", DSP_TYPE_REMOTE, 1024, false}; }
+    DspNodeDescriptor get_descriptor() const override { return {"External_Host", DSP_ACCEL_TYPE_REMOTE, 1024, false}; }
 };
 }}
