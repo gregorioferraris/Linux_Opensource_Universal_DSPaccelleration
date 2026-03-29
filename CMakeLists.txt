@@ -1,11 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
-file(STRINGS "VERSION" PROJECT_VERSION_FULL)
-string(STRIP "${PROJECT_VERSION_FULL}" PROJECT_VERSION_FULL)
+file(READ "VERSION" PROJECT_VERSION_RAW)
+string(STRIP "${PROJECT_VERSION_RAW}" PROJECT_VERSION_RAW)
 
-# CMake's project() version must be in major[.minor[.patch[.tweak]]] format.
-# We extract the numeric part (e.g., "0.1.0") from strings like "0.1.0-alpha".
-string(REGEX MATCH "^[0-9.]+" PROJECT_VERSION_CLEAN "${PROJECT_VERSION_FULL}")
+# Extract numeric part (e.g. 0.1.0) for CMake's project() version compatibility
+if(PROJECT_VERSION_RAW MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+    set(PROJECT_VERSION_CLEAN "${CMAKE_MATCH_1}")
+else()
+    set(PROJECT_VERSION_CLEAN "0.1.0")
+endif()
 
 project(LinuxDSPAcceleration VERSION ${PROJECT_VERSION_CLEAN} LANGUAGES C CXX)
 
